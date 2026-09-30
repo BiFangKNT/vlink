@@ -3,10 +3,26 @@
 LOGFILE="$(dirname "$0")/vlink_last_run.log"
 declare -a CREATED_ITEMS=()
 
+write_created_log() {
+  if (( ${#CREATED_ITEMS[@]} > 0 )); then
+    printf '%s\n' "${CREATED_ITEMS[@]}" > "$LOGFILE"
+  else
+    : > "$LOGFILE"
+  fi
+}
+
+abort_run() {
+  echo "$1" >&2
+  if (( ${#CREATED_ITEMS[@]} > 0 )); then
+    write_created_log || echo "写入运行记录失败: $LOGFILE" >&2
+  fi
+  exit 1
+}
+
 cleanup() {
   echo ""
   echo "捕获退出信号，写入已创建文件/目录列表到：$LOGFILE"
-  printf '%s\n' "${CREATED_ITEMS[@]}" > "$LOGFILE"
+  write_created_log
   echo "已写入 ${#CREATED_ITEMS[@]} 条记录。"
   exit 1
 }
@@ -162,17 +178,30 @@ if [[ $CMD_UNDO -eq 1 ]]; then
     exit 1
   fi
   echo "开始撤销..."
-  while IFS= read -r item; do
-    if [[ -d "$item" ]]; then
-      echo "删除目录 $item"
-      rm -rf "$item"
-    elif [[ -f "$item" ]]; then
+  mapfile -t undo_items < "$LOGFILE"
+  undo_failed=0
+  for item in "${undo_items[@]}"; do
+    if [[ -f "$item" || -L "$item" ]]; then
       echo "删除文件 $item"
-      rm -f "$item"
+      rm -f -- "$item" || undo_failed=1
     fi
-  done < "$LOGFILE"
+  done
+  for ((i=${#undo_items[@]}-1; i>=0; i--)); do
+    item="${undo_items[i]}"
+    if [[ -d "$item" && ! -L "$item" ]]; then
+      echo "删除空目录 $item"
+      if ! rmdir -- "$item"; then
+        echo "保留未能删除的目录: $item" >&2
+        undo_failed=1
+      fi
+    fi
+  done
+  if (( undo_failed )); then
+    echo "部分路径未删除，保留撤销记录。" >&2
+    exit 1
+  fi
+  rm -f -- "$LOGFILE" || exit 1
   echo "撤销完成。"
-  rm -f "$LOGFILE"
   exit 0
 fi
 
@@ -369,7 +398,7 @@ prompt_rename() {
   local ext="${oldname##*.}"
   local newbase=""
   while :; do
-    read -p "输入新文件名（无后缀），输入 pass 跳过: " newbase
+    read -r -p "输入新文件名（无后缀），输入 pass 跳过: " newbase || return 2
     [[ "$newbase" == "pass" ]] && { echo "skip"; return 1; }
     [[ -z "$newbase" ]] && { echo "文件名不能为空"; continue; }
     local candidate="${newbase}.${ext}"
@@ -394,6 +423,43 @@ prompt_rename_dir() {
 
 add_created() {
   CREATED_ITEMS+=("$1")
+}
+
+create_directory() {
+  local directory="$1"
+  local parent
+  [[ -d "$directory" ]] && return 0
+  parent=$(dirname -- "$directory")
+  [[ -d "$parent" ]] || create_directory "$parent"
+  mkdir -- "$directory" || abort_run "创建目录失败: $directory"
+  add_created "$directory"
+}
+
+create_link() {
+  local source="$1"
+  local target="$2"
+  ln -- "$source" "$target" || abort_run "创建硬链接失败: $target"
+  echo "创建硬链接: $target"
+  add_created "$target"
+}
+
+replace_link() {
+  local source="$1"
+  local target="$2"
+  local temporary_directory
+  temporary_directory=$(mktemp -d "$(dirname -- "$target")/.vlink.XXXXXX") || abort_run "创建临时目录失败: $target"
+  if ! ln -- "$source" "$temporary_directory/link"; then
+    rmdir -- "$temporary_directory"
+    abort_run "创建硬链接失败，保留原目标: $target"
+  fi
+  if ! mv -fT -- "$temporary_directory/link" "$target"; then
+    rm -f -- "$temporary_directory/link"
+    rmdir -- "$temporary_directory"
+    abort_run "替换硬链接失败，保留原目标: $target"
+  fi
+  add_created "$target"
+  rmdir -- "$temporary_directory" || abort_run "清理临时目录失败: $temporary_directory"
+  echo "创建硬链接: $target"
 }
 
 check_skip_or_rename() {
@@ -437,7 +503,7 @@ fast_mode() {
       if [[ -n "${exist_map[$base]}" ]]; then
         echo "一键执行模式遇目标目录重名: $base，必须处理"
         while :; do
-          read -p "输入新目录名，或 pass 跳过: " newname
+          read -r -p "输入新目录名，或 pass 跳过: " newname || abort_run "输入已结束，停止处理。"
           [[ "$newname" == "pass" ]] && { echo "跳过目录 $base"; base=""; break; }
           [[ -z "$newname" ]] && { echo "不能为空"; continue; }
           [[ -n "${exist_map[$newname]}" ]] && { echo "已存在，重试"; continue; }
@@ -447,9 +513,8 @@ fast_mode() {
         [[ -z "$base" ]] && continue
       fi
       target_dir="$DST/$base"
-      mkdir -p "$target_dir"
+      create_directory "$target_dir"
       echo "创建目录 $target_dir"
-      add_created "$target_dir"
       exist_map["$base"]="dir"
       dir_targetname_map["$d"]="$target_dir"
     done
@@ -468,7 +533,7 @@ fast_mode() {
       target_base_dir="${dir_targetname_map["$SRC/$top_dir"]}"
       sub_rel_dir="${rel_path#*/}"
       sub_rel_dir_dir=$(dirname "$sub_rel_dir")
-      [[ "$sub_rel_dir_dir" != "." ]] && { target_base_dir="$target_base_dir/$sub_rel_dir_dir"; mkdir -p "$target_base_dir"; }
+      [[ "$sub_rel_dir_dir" != "." ]] && { target_base_dir="$target_base_dir/$sub_rel_dir_dir"; create_directory "$target_base_dir"; }
     fi
 
     basef=$(basename "$f")
@@ -482,7 +547,7 @@ fast_mode() {
 
       if [[ -e "$target_f" ]]; then
         echo "重名文件: $target_f，必须处理"
-        read -p "输入新文件名(无后缀)或 pass跳过，end结束: " nn
+        read -r -p "输入新文件名(无后缀)或 pass跳过，end结束: " nn || abort_run "输入已结束，停止处理。"
         if [[ "$nn" == "end" ]]; then
           echo "结束剩余文件处理"
           target_f=""
@@ -503,9 +568,7 @@ fast_mode() {
     done
     [[ -z "$target_f" ]] && continue
 
-    ln "$f" "$target_f"
-    echo "创建硬链接: $target_f"
-    add_created "$target_f"
+    create_link "$f" "$target_f"
     exist_map["$(basename "$target_f")"]="file"
     ((curr_e++))
   done
@@ -566,7 +629,7 @@ collect_files_and_dirs
 
 if [[ $USE_FAST -eq 1 ]]; then
   fast_mode
-  printf '%s\n' "${CREATED_ITEMS[@]}" > "$LOGFILE"
+  write_created_log || abort_run "写入运行记录失败: $LOGFILE"
   exit 0
 elif [[ $USE_RECURSIVE -eq 1 ]]; then
   declare -A dir_targetname_map=()
@@ -578,7 +641,7 @@ elif [[ $USE_RECURSIVE -eq 1 ]]; then
       continue
     fi
     target_dir="$DST/$newname"
-    [[ ! -d "$target_dir" ]] && { mkdir -p "$target_dir"; echo "创建目录: $target_dir"; add_created "$target_dir"; exist_map["$newname"]="dir"; }
+    [[ ! -d "$target_dir" ]] && { create_directory "$target_dir"; echo "创建目录: $target_dir"; exist_map["$newname"]="dir"; }
     dir_targetname_map["$d"]="$target_dir"
   done
   for f in "${files[@]}"; do
@@ -588,14 +651,14 @@ elif [[ $USE_RECURSIVE -eq 1 ]]; then
       target_base_dir="${dir_targetname_map["$SRC/$top_dir"]}"
       sub_rel_dir="${rel_path#*/}"
       sub_rel_dir_dir=$(dirname "$sub_rel_dir")
-      [[ "$sub_rel_dir_dir" != "." ]] && { target_base_dir="$target_base_dir/$sub_rel_dir_dir"; mkdir -p "$target_base_dir"; }
+      [[ "$sub_rel_dir_dir" != "." ]] && { target_base_dir="$target_base_dir/$sub_rel_dir_dir"; create_directory "$target_base_dir"; }
     }
     basef=$(basename "$f")
     target_f="$target_base_dir/$basef"
     if [[ -e "$target_f" ]]; then
       echo "文件重名: $target_f"
       while :; do
-        read -p "输入新文件名(无后缀)或 pass跳过: " nn
+        read -r -p "输入新文件名(无后缀)或 pass跳过: " nn || abort_run "输入已结束，停止处理。"
         [[ "$nn" == "pass" ]] && { echo "跳过 $f"; target_f=""; break; }
         [[ -z "$nn" ]] && { echo "不能为空"; continue; }
         target_new="$target_base_dir/$nn.${basef##*.}"
@@ -605,9 +668,7 @@ elif [[ $USE_RECURSIVE -eq 1 ]]; then
       done
       [[ -z "$target_f" ]] && continue
     fi
-    ln "$f" "$target_f"
-    echo "创建硬链接: $target_f"
-    add_created "$target_f"
+    create_link "$f" "$target_f"
   done
   echo "递归完成."
 elif [[ $USE_ORIGINAL -eq 1 ]]; then
@@ -620,13 +681,15 @@ elif [[ $USE_ORIGINAL -eq 1 ]]; then
     target="$DST/$base"
     if [[ -e "$target" ]]; then
       echo "重名文件: $base"
-      newname=$(prompt_rename "$base")
-      [[ $? -eq 1 ]] && { echo "跳过 $base"; continue; }
-      target="$DST/$newname"
+      if newname=$(prompt_rename "$base"); then
+        target="$DST/$newname"
+      else
+        rename_status=$?
+        [[ $rename_status -eq 1 ]] && { echo "跳过 $base"; continue; }
+        abort_run "输入已结束，停止处理。"
+      fi
     fi
-    ln "$f" "$target"
-    echo "创建硬链接: $target"
-    add_created "$target"
+    create_link "$f" "$target"
     exist_map["$(basename "$target")"]="file"
   done
 else
@@ -640,6 +703,10 @@ else
   files=("${tmp_files[@]}")
 
   for f in "${files[@]}"; do
+    if [[ $HAS_END_SEQ -eq 1 && $curr_e -gt $end_e ]]; then
+      echo "已达到结束序号 $(format_seq $start_s $end_e)，停止处理剩余文件。"
+      break
+    fi
     base=$(basename "$f")
     ext="${base##*.}"
     name="${base%.*}"
@@ -652,13 +719,10 @@ else
       echo "默认命名: $newname"
       if [[ -e "$target" ]]; then
         echo "目标已存在: $newname"
-        read -p "输入新名字（无后缀）pass跳过，end结束，回车覆盖: " newbasename
+        read -r -p "输入新名字（无后缀）pass跳过，end结束，回车覆盖: " newbasename || abort_run "输入已结束，停止处理。"
         if [[ -z "$newbasename" ]]; then
           echo "覆盖文件 $newname"
-          rm -f "$target"
-          ln "$f" "$target"
-          echo "创建硬链接: $target"
-          add_created "$target"
+          replace_link "$f" "$target"
           exist_map["$newname"]="file"
           ((curr_e++))
           break
@@ -672,27 +736,21 @@ else
           candidate="${newbasename}.${ext}"
           [[ -e "$DST/$candidate" ]] && { echo "冲突 $candidate 重试"; continue; }
           target="$DST/$candidate"
-          ln "$f" "$target"
-          echo "创建硬链接: $target"
-          add_created "$target"
+          create_link "$f" "$target"
           exist_map["$candidate"]="file"
           ((curr_e++))
           break
         fi
       else
         [[ $USE_FAST -eq 1 ]] && {
-          ln "$f" "$target"
-          echo "创建硬链接: $target"
-          add_created "$target"
+          create_link "$f" "$target"
           exist_map["$newname"]="file"
           ((curr_e++))
           break
         }
-        read -p "回车接受默认，sXXeXX改序号，pass跳过，end结束: " input
+        read -r -p "回车接受默认，sXXeXX改序号，pass跳过，end结束: " input || abort_run "输入已结束，停止处理。"
         if [[ -z "$input" ]]; then
-          ln "$f" "$target"
-          echo "创建硬链接: $target"
-          add_created "$target"
+          create_link "$f" "$target"
           exist_map["$newname"]="file"
           ((curr_e++))
           break
@@ -739,7 +797,7 @@ else
 fi
 
 echo "写入已创建文件和目录列表到 $LOGFILE"
-printf '%s\n' "${CREATED_ITEMS[@]}" > "$LOGFILE"
+write_created_log || abort_run "写入运行记录失败: $LOGFILE"
 echo "共生成 ${#CREATED_ITEMS[@]} 个文件/目录"
 
 if [[ $USE_FAST -eq 0 ]]; then
