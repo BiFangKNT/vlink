@@ -33,12 +33,11 @@ show_help() {
 用法: $(basename "$0") [选项] <源路径> [目标路径] [起始序号 sXXeXX] [过滤正则]
 
 功能:
-  硬链接管理工具，支持视频硬链接、递归、自动重命名交互及一键执行。
+  硬链接管理工具，支持指定目录的视频硬链接、自动重命名交互及一键执行。
 
 选项:
   -h, --help           显示帮助
-  -o, --original-name  非递归，视频原名硬链接，无重命名无交互（冲突跳过）
-  -r, --recursive      递归处理所有文件，保留目录结构，交互重名
+  -o, --original-name  视频原名硬链接，无重命名无交互（冲突跳过）
   -f                   默认模式一键执行（自动重命名，无交互，遇重名停止）
   -undo                撤销上次执行生成的所有文件和目录
   -op, --origin-path   指定源路径（等同于第一个位置参数）
@@ -71,9 +70,6 @@ show_help() {
   原名硬链接无交互：
     $ $(basename "$0") -o /源路径 /目标路径
 
-  递归保目录结构交互重名：
-    $ $(basename "$0") -r /源路径 /目标路径
-
   自动重命名一键执行，无交互遇重名停：
     $ $(basename "$0") -f /源路径 /目标路径
 
@@ -88,7 +84,6 @@ format_seq() {
 }
 
 USE_ORIGINAL=0
-USE_RECURSIVE=0
 CMD_UNDO=0
 USE_FAST=0
 
@@ -114,10 +109,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     -o|--original-name)
       USE_ORIGINAL=1
-      shift
-      ;;
-    -r|--recursive)
-      USE_RECURSIVE=1
       shift
       ;;
     -undo)
@@ -205,7 +196,7 @@ if [[ $CMD_UNDO -eq 1 ]]; then
   exit 0
 fi
 
-if [[ $USE_FAST -eq 1 && ($USE_ORIGINAL -eq 1 || $USE_RECURSIVE -eq 1 || $CMD_UNDO -eq 1) ]]; then
+if [[ $USE_FAST -eq 1 && ($USE_ORIGINAL -eq 1 || $CMD_UNDO -eq 1) ]]; then
   echo "-f不可和其他选项组合使用"
   exit 1
 fi
@@ -261,18 +252,8 @@ collect_files_and_dirs() {
   if [[ -f "$SRC" ]]; then
     files+=("$SRC")
   else
-    if [[ $USE_RECURSIVE -eq 1 ]]; then
-      while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$SRC" -type f -print0)
-      while IFS= read -r -d '' d; do dirs+=("$d"); done < <(find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0)
-    else
-      while IFS= read -r -d '' d; do dirs+=("$d"); done < <(find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0)
-
-      if [[ $USE_ORIGINAL -eq 1 ]]; then
-        while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$SRC" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
-      else
-        while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$SRC" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
-      fi
-    fi
+    while IFS= read -r -d '' d; do dirs+=("$d"); done < <(find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0)
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$SRC" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
   fi
 
   apply_filter
@@ -288,30 +269,16 @@ collect_files_and_dirs() {
 count_files_in_dir() {
   local d="$1"
   local c=0
-  if [[ $USE_RECURSIVE -eq 1 ]]; then
-    if [[ -z "$FILTER_REGEX" && -z "$FILTER_EXCLUDE_REGEX" ]]; then
-      c=$(find "$d" -type f | wc -l)
-    else
-      while IFS= read -r -d "" f; do
-        local base
-        base=$(basename "$f")
-        [[ -n "$FILTER_REGEX" ]] && [[ ! "$base" =~ $FILTER_REGEX ]] && continue
-        [[ -n "$FILTER_EXCLUDE_REGEX" ]] && [[ "$base" =~ $FILTER_EXCLUDE_REGEX ]] && continue
-        ((c++))
-      done < <(find "$d" -type f -print0)
-    fi
+  if [[ -z "$FILTER_REGEX" && -z "$FILTER_EXCLUDE_REGEX" ]]; then
+    c=$(find "$d" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) | wc -l)
   else
-    if [[ -z "$FILTER_REGEX" && -z "$FILTER_EXCLUDE_REGEX" ]]; then
-      c=$(find "$d" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) | wc -l)
-    else
-      while IFS= read -r -d "" f; do
-        local base
-        base=$(basename "$f")
-        [[ -n "$FILTER_REGEX" ]] && [[ ! "$base" =~ $FILTER_REGEX ]] && continue
-        [[ -n "$FILTER_EXCLUDE_REGEX" ]] && [[ "$base" =~ $FILTER_EXCLUDE_REGEX ]] && continue
-        ((c++))
-      done < <(find "$d" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
-    fi
+    while IFS= read -r -d "" f; do
+      local base
+      base=$(basename "$f")
+      [[ -n "$FILTER_REGEX" ]] && [[ ! "$base" =~ $FILTER_REGEX ]] && continue
+      [[ -n "$FILTER_EXCLUDE_REGEX" ]] && [[ "$base" =~ $FILTER_EXCLUDE_REGEX ]] && continue
+      ((c++))
+    done < <(find "$d" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
   fi
   echo "$c"
 }
@@ -359,12 +326,12 @@ preview_mode() {
     local printed=0
     for f in "${files[@]}"; do
       base=$(basename "$f")
-      if [[ $USE_RECURSIVE -eq 0 && $USE_ORIGINAL -eq 0 && $HAS_END_SEQ -eq 1 && $temp_curr_e -gt $end_e ]]; then
+      if [[ $USE_ORIGINAL -eq 0 && $HAS_END_SEQ -eq 1 && $temp_curr_e -gt $end_e ]]; then
         echo "  (达到结束序号 $(format_seq $start_s $end_e)，后续文件未展示)"
         printed=1
         break
       fi
-      if [[ $USE_RECURSIVE -eq 0 && $USE_ORIGINAL -eq 0 ]]; then
+      if [[ $USE_ORIGINAL -eq 0 ]]; then
         ext="${base##*.}"
         name="${base%.*}"
         seqname="$(format_seq $temp_curr_s $temp_curr_e)"
@@ -408,31 +375,8 @@ prompt_rename() {
   done
 }
 
-prompt_rename_dir() {
-  local olddir="$1"
-  local base=$(basename "$olddir")
-  while :; do
-    read -p "目录 '$base' 已存在，输入新目录名，或 pass 跳过: " newname
-    [[ "$newname" == "pass" ]] && { echo "skip"; return 1; }
-    [[ -z "$newname" ]] && { echo "目录名不能为空"; continue; }
-    [[ -n "${exist_map[$newname]}" ]] && { echo "目录名已存在，重试"; continue; }
-    echo "$newname"
-    return 0
-  done
-}
-
 add_created() {
   CREATED_ITEMS+=("$1")
-}
-
-create_directory() {
-  local directory="$1"
-  local parent
-  [[ -d "$directory" ]] && return 0
-  parent=$(dirname -- "$directory")
-  [[ -d "$parent" ]] || create_directory "$parent"
-  mkdir -- "$directory" || abort_run "创建目录失败: $directory"
-  add_created "$directory"
 }
 
 create_link() {
@@ -462,80 +406,15 @@ replace_link() {
   echo "创建硬链接: $target"
 }
 
-check_skip_or_rename() {
-  local targetpath="$1"
-  local isdir="$2"
-  local basename=$(basename "$targetpath")
-  if [[ -n "${exist_map[$basename]}" ]]; then
-    if [[ $isdir -eq 1 ]]; then
-      echo "目标已有同名目录: $basename"
-      local newname
-      if newname=$(prompt_rename_dir "$basename"); then
-        echo "$newname"
-        return 0
-      else
-        return 1
-      fi
-    else
-      echo "目标已有同名文件: $basename"
-      local newname
-      if newname=$(prompt_rename "$basename"); then
-        echo "$newname"
-        return 0
-      else
-        return 1
-      fi
-    fi
-  else
-    echo "$basename"
-    return 0
-  fi
-}
-
 fast_mode() {
   collect_files_and_dirs
   scan_target_one_level
-
-  declare -A dir_targetname_map=()
-  if [[ $USE_RECURSIVE -eq 1 ]]; then
-    for d in "${dirs[@]}"; do
-      base=$(basename "$d")
-      if [[ -n "${exist_map[$base]}" ]]; then
-        echo "一键执行模式遇目标目录重名: $base，必须处理"
-        while :; do
-          read -r -p "输入新目录名，或 pass 跳过: " newname || abort_run "输入已结束，停止处理。"
-          [[ "$newname" == "pass" ]] && { echo "跳过目录 $base"; base=""; break; }
-          [[ -z "$newname" ]] && { echo "不能为空"; continue; }
-          [[ -n "${exist_map[$newname]}" ]] && { echo "已存在，重试"; continue; }
-          base="$newname"
-          break
-        done
-        [[ -z "$base" ]] && continue
-      fi
-      target_dir="$DST/$base"
-      create_directory "$target_dir"
-      echo "创建目录 $target_dir"
-      exist_map["$base"]="dir"
-      dir_targetname_map["$d"]="$target_dir"
-    done
-  fi
 
   for f in "${files[@]}"; do
     if [[ $HAS_END_SEQ -eq 1 && $curr_e -gt $end_e ]]; then
       echo "已达到结束序号 $(format_seq $start_s $end_e)，停止处理剩余文件。"
       break
     fi
-    rel_path="${f#$SRC/}"
-    top_dir="${rel_path%%/*}"
-
-    target_base_dir="$DST"
-    if [[ $USE_RECURSIVE -eq 1 && -n "$top_dir" && "$rel_path" != "$top_dir" ]]; then
-      target_base_dir="${dir_targetname_map["$SRC/$top_dir"]}"
-      sub_rel_dir="${rel_path#*/}"
-      sub_rel_dir_dir=$(dirname "$sub_rel_dir")
-      [[ "$sub_rel_dir_dir" != "." ]] && { target_base_dir="$target_base_dir/$sub_rel_dir_dir"; create_directory "$target_base_dir"; }
-    fi
-
     basef=$(basename "$f")
     ext="${basef##*.}"
     name="${basef%.*}"
@@ -543,7 +422,7 @@ fast_mode() {
     while :; do
       seqname="$(format_seq $curr_s $curr_e)"
       newname="${name} - ${seqname}.${ext}"
-      target_f="$target_base_dir/$newname"
+      target_f="$DST/$newname"
 
       if [[ -e "$target_f" ]]; then
         echo "重名文件: $target_f，必须处理"
@@ -555,7 +434,7 @@ fast_mode() {
         fi
         [[ "$nn" == "pass" ]] && { echo "跳过文件 $f"; target_f=""; break; }
         [[ -z "$nn" ]] && { echo "文件名不能为空"; continue; }
-        candidate="$target_base_dir/$nn.$ext"
+        candidate="$DST/$nn.$ext"
         if [[ -e "$candidate" ]]; then
           echo "文件已存在，重试"
           continue
@@ -580,7 +459,7 @@ fast_mode() {
 
 start_s=1
 start_e=1
-if [[ $USE_RECURSIVE -eq 0 && $USE_ORIGINAL -eq 0 && -n "$START_SEQ" ]]; then
+if [[ $USE_ORIGINAL -eq 0 && -n "$START_SEQ" ]]; then
   if [[ "$START_SEQ" =~ $SEQ_REGEX ]]; then
     start_s_str="${BASH_REMATCH[1]}"
     start_e_str="${BASH_REMATCH[2]}"
@@ -631,46 +510,6 @@ if [[ $USE_FAST -eq 1 ]]; then
   fast_mode
   write_created_log || abort_run "写入运行记录失败: $LOGFILE"
   exit 0
-elif [[ $USE_RECURSIVE -eq 1 ]]; then
-  declare -A dir_targetname_map=()
-  for d in "${dirs[@]}"; do
-    base=$(basename "$d")
-    newname=$(check_skip_or_rename "$DST/$base" 1)
-    if [[ "$newname" == "skip" ]]; then
-      echo "跳过目录 $base"
-      continue
-    fi
-    target_dir="$DST/$newname"
-    [[ ! -d "$target_dir" ]] && { create_directory "$target_dir"; echo "创建目录: $target_dir"; exist_map["$newname"]="dir"; }
-    dir_targetname_map["$d"]="$target_dir"
-  done
-  for f in "${files[@]}"; do
-    rel_path="${f#$SRC/}"
-    top_dir="${rel_path%%/*}"
-    [[ "$top_dir" == "$rel_path" ]] && target_base_dir="$DST" || {
-      target_base_dir="${dir_targetname_map["$SRC/$top_dir"]}"
-      sub_rel_dir="${rel_path#*/}"
-      sub_rel_dir_dir=$(dirname "$sub_rel_dir")
-      [[ "$sub_rel_dir_dir" != "." ]] && { target_base_dir="$target_base_dir/$sub_rel_dir_dir"; create_directory "$target_base_dir"; }
-    }
-    basef=$(basename "$f")
-    target_f="$target_base_dir/$basef"
-    if [[ -e "$target_f" ]]; then
-      echo "文件重名: $target_f"
-      while :; do
-        read -r -p "输入新文件名(无后缀)或 pass跳过: " nn || abort_run "输入已结束，停止处理。"
-        [[ "$nn" == "pass" ]] && { echo "跳过 $f"; target_f=""; break; }
-        [[ -z "$nn" ]] && { echo "不能为空"; continue; }
-        target_new="$target_base_dir/$nn.${basef##*.}"
-        [[ -e "$target_new" ]] && { echo "已存在"; continue; }
-        target_f="$target_new"
-        break
-      done
-      [[ -z "$target_f" ]] && continue
-    fi
-    create_link "$f" "$target_f"
-  done
-  echo "递归完成."
 elif [[ $USE_ORIGINAL -eq 1 ]]; then
   for f in "${files[@]}"; do
     if [[ $HAS_END_SEQ -eq 1 && $curr_e -gt $end_e ]]; then
