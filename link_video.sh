@@ -28,9 +28,10 @@ show_help() {
   -op, --origin-path   指定源路径（等同于第一个位置参数）
   -lp, --link-path     指定目标硬链接目录（等同于第二个位置参数）
   -sn, --sequence      指定起始/结束序号，格式 sXXeXX[-|,]sXXeYY
-  -fi, --filter        指定过滤正则，使用引号包裹
+  -fi, --filter        指定包含正则，仅匹配符合的文件（使用引号包裹）
+  -fe, --filter-exclude 指定排除正则，跳过符合的文件（使用引号包裹）
 
-参数:
+  参数:
   源路径：必须
   目标路径：撤销和预览除外必须
   起始序号：sXXeXX 或 sXXeXX,sXXeYY（sXXeXX-sXXeYY），仅默认模式有效，默认 s01e01
@@ -40,6 +41,8 @@ show_help() {
   预览源路径待处理文件：
     $ $(basename "$0") /源路径
 
+  指定包含和排除正则：
+    $ $(basename "$0") -op /源路径 -lp /目标路径 -fi "1080p" -fe "Special"
   自动重命名交互（默认）：
     $ $(basename "$0") /源路径 /目标路径 s01e01
 
@@ -73,7 +76,6 @@ USE_RECURSIVE=0
 CMD_UNDO=0
 USE_FAST=0
 
-# 序号格式化位数，默认2位
 seq_s_digits=2
 seq_e_digits=2
 HAS_END_SEQ=0
@@ -81,6 +83,7 @@ end_s=0
 end_e=0
 SEQ_REGEX='^s([0-9]+)e([0-9]+)([,-]s([0-9]+)e([0-9]+))?$'
 FILTER_REGEX=""
+FILTER_EXCLUDE_REGEX=""
 
 SRC=""
 DST=""
@@ -127,6 +130,11 @@ while [[ $# -gt 0 ]]; do
     -fi|--filter)
       [[ $# -ge 2 ]] || { echo "-fi 需要正则参数"; exit 1; }
       FILTER_REGEX="$2"
+      shift 2
+      ;;
+    -fe|--filter-exclude)
+      [[ $# -ge 2 ]] || { echo "-fe 需要正则参数"; exit 1; }
+      FILTER_EXCLUDE_REGEX="$2"
       shift 2
       ;;
     --)
@@ -210,7 +218,6 @@ if [[ ! -e "$SRC" ]]; then
 fi
 
 if [[ -n "$DST" ]]; then
-  # 将相对路径转换为绝对路径
   DST=$(realpath "$DST" 2>/dev/null) || DST=$(cd "$(dirname "$DST")" && pwd)/$(basename "$DST")
   if [[ ! -d "$DST" ]]; then
     echo "目标路径必须是已存在目录"
@@ -241,7 +248,6 @@ collect_files_and_dirs() {
 
   apply_filter
 
-  # 对文件和目录进行排序
   if [[ ${#files[@]} -gt 0 ]]; then
     IFS=$'\n' files=($(sort <<<"${files[*]}")); unset IFS
   fi
@@ -254,23 +260,27 @@ count_files_in_dir() {
   local d="$1"
   local c=0
   if [[ $USE_RECURSIVE -eq 1 ]]; then
-    if [[ -z "$FILTER_REGEX" ]]; then
+    if [[ -z "$FILTER_REGEX" && -z "$FILTER_EXCLUDE_REGEX" ]]; then
       c=$(find "$d" -type f | wc -l)
     else
       while IFS= read -r -d "" f; do
         local base
         base=$(basename "$f")
-        [[ "$base" =~ $FILTER_REGEX ]] && ((c++))
+        [[ -n "$FILTER_REGEX" ]] && [[ ! "$base" =~ $FILTER_REGEX ]] && continue
+        [[ -n "$FILTER_EXCLUDE_REGEX" ]] && [[ "$base" =~ $FILTER_EXCLUDE_REGEX ]] && continue
+        ((c++))
       done < <(find "$d" -type f -print0)
     fi
   else
-    if [[ -z "$FILTER_REGEX" ]]; then
+    if [[ -z "$FILTER_REGEX" && -z "$FILTER_EXCLUDE_REGEX" ]]; then
       c=$(find "$d" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) | wc -l)
     else
       while IFS= read -r -d "" f; do
         local base
         base=$(basename "$f")
-        [[ "$base" =~ $FILTER_REGEX ]] && ((c++))
+        [[ -n "$FILTER_REGEX" ]] && [[ ! "$base" =~ $FILTER_REGEX ]] && continue
+        [[ -n "$FILTER_EXCLUDE_REGEX" ]] && [[ "$base" =~ $FILTER_EXCLUDE_REGEX ]] && continue
+        ((c++))
       done < <(find "$d" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
     fi
   fi
@@ -278,14 +288,18 @@ count_files_in_dir() {
 }
 
 apply_filter() {
-  if [[ -z "$FILTER_REGEX" ]]; then return; fi
+  if [[ -z "$FILTER_REGEX" && -z "$FILTER_EXCLUDE_REGEX" ]]; then return; fi
   local filtered=()
   for f in "${files[@]}"; do
     local base
     base=$(basename "$f")
-    if [[ "$base" =~ $FILTER_REGEX ]]; then
-      filtered+=("$f")
+    if [[ -n "$FILTER_REGEX" ]] && [[ ! "$base" =~ $FILTER_REGEX ]]; then
+      continue
     fi
+    if [[ -n "$FILTER_EXCLUDE_REGEX" ]] && [[ "$base" =~ $FILTER_EXCLUDE_REGEX ]]; then
+      continue
+    fi
+    filtered+=("$f")
   done
   files=("${filtered[@]}")
 }
@@ -294,13 +308,16 @@ preview_mode() {
   collect_files_and_dirs
   echo "===== 预览内容 ====="
   if [[ -n "$FILTER_REGEX" ]]; then
-    echo "应用过滤正则: $FILTER_REGEX"
+    echo "应用包含正则: $FILTER_REGEX"
+  fi
+  if [[ -n "$FILTER_EXCLUDE_REGEX" ]]; then
+    echo "应用排除正则: $FILTER_EXCLUDE_REGEX"
   fi
   if [[ ${#dirs[@]} -gt 0 ]]; then
     echo "目录："
     for d in "${dirs[@]}"; do
       n=$(count_files_in_dir "$d")
-      if [[ -n "$FILTER_REGEX" && $n -eq 0 ]]; then
+      if [[ (-n "$FILTER_REGEX" || -n "$FILTER_EXCLUDE_REGEX") && $n -eq 0 ]]; then
         continue
       fi
       echo "  $(basename "$d")   (包含 $n 个文件)"
@@ -319,22 +336,20 @@ preview_mode() {
         break
       fi
       if [[ $USE_RECURSIVE -eq 0 && $USE_ORIGINAL -eq 0 ]]; then
-        # 默认模式或快速模式，显示带序号的文件名
         ext="${base##*.}"
         name="${base%.*}"
         seqname="$(format_seq $temp_curr_s $temp_curr_e)"
         echo "  $base  →  ${name} - ${seqname}.${ext}"
         ((temp_curr_e++))
       else
-        # 其他模式，显示原文件名
         echo "  $base"
       fi
       printed=1
     done
-    if [[ $printed -eq 0 && -n "$FILTER_REGEX" ]]; then
+    if [[ $printed -eq 0 && (-n "$FILTER_REGEX" || -n "$FILTER_EXCLUDE_REGEX") ]]; then
       echo "  (过滤后无匹配文件)"
     fi
-  elif [[ -n "$FILTER_REGEX" ]]; then
+  elif [[ -n "$FILTER_REGEX" || -n "$FILTER_EXCLUDE_REGEX" ]]; then
     echo "文件："
     echo "  (过滤后无匹配文件)"
   fi
@@ -500,7 +515,6 @@ fast_mode() {
   done
 }
 
-# 处理起始序号参数
 start_s=1
 start_e=1
 if [[ $USE_RECURSIVE -eq 0 && $USE_ORIGINAL -eq 0 && -n "$START_SEQ" ]]; then
@@ -736,4 +750,3 @@ if [[ $USE_FAST -eq 0 ]]; then
 fi
 
 exit 0
-
