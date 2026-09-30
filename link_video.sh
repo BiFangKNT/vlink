@@ -1,649 +1,572 @@
 #!/bin/bash
 
-LOGFILE="$(dirname "$0")/vlink_last_run.log"
-declare -a CREATED_ITEMS=()
+set -o pipefail
 
-write_created_log() {
-  if (( ${#CREATED_ITEMS[@]} > 0 )); then
-    printf '%s\n' "${CREATED_ITEMS[@]}" > "$LOGFILE"
-  else
-    : > "$LOGFILE"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+LOGFILE="$SCRIPT_DIR/vlink_last_run.log"
+PENDING_LOG="$LOGFILE.pending"
+LOCK_DIR="$LOGFILE.lock"
+LOCK_HELD=0
+LOG_FORMAT="vlink-log-v2"
+WORK_DIR=""
+LOG_TEMP=""
+MODE="interactive"
+ACTION="link"
+SRC=""
+DST=""
+START_SEQ=""
+FILTER_REGEX=""
+FILTER_EXCLUDE_REGEX=""
+SEQ_REGEX='^s([0-9]+)e([0-9]+)([,-]s([0-9]+)e([0-9]+))?$'
+FILES=()
+DIRECTORIES=()
+CREATED_ITEMS=()
+RECORD_PATHS=()
+RECORD_IDS=()
+RECORD_KINDS=()
+
+fail() {
+  echo "$1" >&2
+  exit "${2:-1}"
+}
+
+cleanup_work() {
+  if [[ -n "$WORK_DIR" ]]; then
+    rm -f -- "$WORK_DIR/files" "$WORK_DIR/directories" "$WORK_DIR/identities" "$WORK_DIR/link"
+    rmdir -- "$WORK_DIR" || echo "未能清理临时目录: $WORK_DIR" >&2
+    WORK_DIR=""
+  fi
+  if [[ -n "$LOG_TEMP" ]]; then
+    rm -f -- "$LOG_TEMP"
+    LOG_TEMP=""
   fi
 }
 
-abort_run() {
-  echo "$1" >&2
-  if (( ${#CREATED_ITEMS[@]} > 0 )); then
-    write_created_log || echo "写入运行记录失败: $LOGFILE" >&2
-  fi
+on_signal() {
+  echo "执行被中断；已发布的链接可通过 -undo 核对并撤销。" >&2
   exit 1
+}
+
+acquire_lock() {
+  mkdir -- "$LOCK_DIR" 2>/dev/null || fail "创建锁失败: $LOCK_DIR；可能已有任务运行，或目录不可写。残留锁需确认原进程结束后手动移除。"
+  LOCK_HELD=1
 }
 
 cleanup() {
-  echo ""
-  echo "捕获退出信号，写入已创建文件/目录列表到：$LOGFILE"
-  write_created_log
-  echo "已写入 ${#CREATED_ITEMS[@]} 条记录。"
-  exit 1
+  cleanup_work
+  if ((LOCK_HELD)); then
+    rmdir -- "$LOCK_DIR" || echo "未能释放锁: $LOCK_DIR" >&2
+  fi
 }
-trap cleanup SIGINT SIGTERM
+
+trap cleanup EXIT
+trap on_signal SIGINT SIGTERM
 
 show_help() {
-  cat << EOF
-用法: $(basename "$0") [选项] <源路径> [目标路径] [起始序号 sXXeXX] [过滤正则]
+  cat <<EOF
+用法: $(basename "$0") [选项] <源路径> [目标路径] [起始序号 sXXeXX] [包含正则]
 
 功能:
-  硬链接管理工具，支持指定目录的视频硬链接、自动重命名交互及一键执行。
+  为源目录当前层级的 .mp4、.mkv 文件创建硬链接，也可直接指定源文件。
+  省略目标路径时仅预览；目标目录必须已存在。
 
 选项:
   -h, --help           显示帮助
   -o, --original-name  视频原名硬链接，无重命名无交互（冲突跳过）
-  -f                   默认模式一键执行（自动重命名，无交互，遇重名停止）
-  -undo                撤销上次执行生成的所有文件和目录
-  -op, --origin-path   指定源路径（等同于第一个位置参数）
-  -lp, --link-path     指定目标硬链接目录（等同于第二个位置参数）
-  -sn, --sequence      指定起始/结束序号，格式 sXXeXX[-|,]sXXeYY
-  -fi, --filter        指定包含正则，仅匹配符合的文件（使用引号包裹）
-  -fe, --filter-exclude 指定排除正则，跳过符合的文件（使用引号包裹）
+  -f                  默认模式一键执行（自动重命名，无交互，遇重名停止）
+  -undo               撤销上次执行生成的文件
+  -op, --origin-path   指定源路径
+  -lp, --link-path     指定目标硬链接目录
+  -sn, --sequence      指定起始/结束序号：sXXeXX 或 sXXeXX-sXXeYY（也支持逗号）
+  -fi, --filter        包含正则，匹配文件名（含后缀）
+  -fe, --filter-exclude 排除正则，跳过匹配文件名（含后缀）的文件
 
-  参数:
-  源路径：必须
-  目标路径：撤销和预览除外必须
-  起始序号：sXXeXX 或 sXXeXX,sXXeYY（sXXeXX-sXXeYY），仅默认模式有效，默认 s01e01
-  过滤正则：可选，匹配文件名，使用引号包裹，无需额外转义，支持正则
+说明:
+  默认起始序号为 s01e01；序号参数仅用于默认和快速模式。
+  正则使用 Bash 扩展正则，区分大小写，使用引号包裹；多个条件可用 | 连接。
+  位置参数中的目标路径固定在源路径之后；预览过滤请使用 -fi、-fe。
+  创建前检查同一文件并提示退出；目标当前层级超过 1000 个文件时，仅检查队列目标路径。
 
 示例:
-  预览源路径待处理文件：
-    $ $(basename "$0") /源路径
-
-  指定包含和排除正则：
-    $ $(basename "$0") -op /源路径 -lp /目标路径 -fi "1080p" -fe "Special"
-  自动重命名交互（默认）：
-    $ $(basename "$0") /源路径 /目标路径 s01e01
-
-  使用命名参数：
-    $ $(basename "$0") -op /源路径 -lp /目标路径 -sn s01e01-s01e12 -fi "1080p"
-
-  指定过滤正则（位置参数方式）：
-    $ $(basename "$0") /源路径 /目标路径 s01e01 "1080p"
-
-  原名硬链接无交互：
-    $ $(basename "$0") -o /源路径 /目标路径
-
-  自动重命名一键执行，无交互遇重名停：
-    $ $(basename "$0") -f /源路径 /目标路径
-
-  撤销上次执行：
-    $ $(basename "$0") -undo
-
+  $(basename "$0") /源路径
+  $(basename "$0") /源路径 /目标路径 s01e01
+  $(basename "$0") -op /源路径 -lp /目标路径 -sn s01e01-s01e12 -fi '1080p' -fe 'Special|OVA'
+  $(basename "$0") -o /源路径 /目标路径
+  $(basename "$0") -f /源路径 /目标路径
+  $(basename "$0") -undo
 EOF
 }
 
-format_seq() { 
-  printf "s%0${seq_s_digits}de%0${seq_e_digits}d" "$1" "$2"
+set_mode() {
+  [[ "$MODE" == interactive || "$MODE" == "$1" ]] || fail "-f 不可和 -o 组合使用"
+  MODE="$1"
 }
 
-USE_ORIGINAL=0
-CMD_UNDO=0
-USE_FAST=0
-
-seq_s_digits=2
-seq_e_digits=2
-HAS_END_SEQ=0
-end_s=0
-end_e=0
-SEQ_REGEX='^s([0-9]+)e([0-9]+)([,-]s([0-9]+)e([0-9]+))?$'
-FILTER_REGEX=""
-FILTER_EXCLUDE_REGEX=""
-
-SRC=""
-DST=""
-START_SEQ=""
-POSITIONAL_ARGS=()
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -h|--help)
+parse_args() {
+  local positional=()
+  while (($# > 0)); do
+    case "$1" in
+    -h | --help)
       show_help
       exit 0
       ;;
-    -o|--original-name)
-      USE_ORIGINAL=1
-      shift
-      ;;
-    -undo)
-      CMD_UNDO=1
+    -o | --original-name)
+      set_mode original
       shift
       ;;
     -f)
-      USE_FAST=1
+      set_mode fast
       shift
       ;;
-    -op|--origin-path)
-      [[ $# -ge 2 ]] || { echo "-op 需要路径参数"; exit 1; }
-      SRC="$2"
-      shift 2
+    -undo)
+      ACTION="undo"
+      shift
       ;;
-    -lp|--link-path)
-      [[ $# -ge 2 ]] || { echo "-lp 需要路径参数"; exit 1; }
-      DST="$2"
-      shift 2
-      ;;
-    -sn|--sequence)
-      [[ $# -ge 2 ]] || { echo "-sn 需要序号参数"; exit 1; }
-      START_SEQ="$2"
-      shift 2
-      ;;
-    -fi|--filter)
-      [[ $# -ge 2 ]] || { echo "-fi 需要正则参数"; exit 1; }
-      FILTER_REGEX="$2"
-      shift 2
-      ;;
-    -fe|--filter-exclude)
-      [[ $# -ge 2 ]] || { echo "-fe 需要正则参数"; exit 1; }
-      FILTER_EXCLUDE_REGEX="$2"
+    -op | --origin-path | -lp | --link-path | -sn | --sequence | -fi | --filter | -fe | --filter-exclude)
+      (($# >= 2)) || fail "$1 需要参数"
+      case "$1" in
+      -op | --origin-path) SRC="$2" ;;
+      -lp | --link-path) DST="$2" ;;
+      -sn | --sequence) START_SEQ="$2" ;;
+      -fi | --filter) FILTER_REGEX="$2" ;;
+      -fe | --filter-exclude) FILTER_EXCLUDE_REGEX="$2" ;;
+      esac
       shift 2
       ;;
     --)
       shift
-      while [[ $# -gt 0 ]]; do
-        POSITIONAL_ARGS+=("$1")
-        shift
-      done
+      positional+=("$@")
       break
       ;;
-    -*)
-      echo "未知选项 $1，使用 -h 查看帮助"
-      exit 1
-      ;;
+    -*) fail "未知选项 $1，使用 -h 查看帮助" ;;
     *)
-      POSITIONAL_ARGS+=("$1")
+      positional+=("$1")
       shift
       ;;
-  esac
-done
-
-if [[ $CMD_UNDO -eq 1 ]]; then
-  if [[ ! -f "$LOGFILE" ]]; then
-    echo "未找到上次记录，无法撤销"
-    exit 1
-  fi
-  echo "开始撤销..."
-  mapfile -t undo_items < "$LOGFILE"
-  undo_failed=0
-  for item in "${undo_items[@]}"; do
-    if [[ -f "$item" || -L "$item" ]]; then
-      echo "删除文件 $item"
-      rm -f -- "$item" || undo_failed=1
-    fi
+    esac
   done
-  for ((i=${#undo_items[@]}-1; i>=0; i--)); do
-    item="${undo_items[i]}"
-    if [[ -d "$item" && ! -L "$item" ]]; then
-      echo "删除空目录 $item"
-      if ! rmdir -- "$item"; then
-        echo "保留未能删除的目录: $item" >&2
-        undo_failed=1
-      fi
-    fi
-  done
-  if (( undo_failed )); then
-    echo "部分路径未删除，保留撤销记录。" >&2
-    exit 1
+  set -- "${positional[@]}"
+  if [[ -z "$SRC" ]] && (($# > 0)); then
+    SRC="$1"
+    shift
   fi
-  rm -f -- "$LOGFILE" || exit 1
-  echo "撤销完成。"
-  exit 0
-fi
-
-if [[ $USE_FAST -eq 1 && ($USE_ORIGINAL -eq 1 || $CMD_UNDO -eq 1) ]]; then
-  echo "-f不可和其他选项组合使用"
-  exit 1
-fi
-
-if [[ -z "$SRC" && ${#POSITIONAL_ARGS[@]} -gt 0 ]]; then
-  SRC="${POSITIONAL_ARGS[0]}"
-  POSITIONAL_ARGS=("${POSITIONAL_ARGS[@]:1}")
-fi
-
-for arg in "${POSITIONAL_ARGS[@]}"; do
-  if [[ -z "$START_SEQ" && "$arg" =~ $SEQ_REGEX ]]; then
-    START_SEQ="$arg"
-    continue
+  if [[ -z "$DST" ]] && (($# > 0)); then
+    DST="$1"
+    shift
   fi
-  if [[ -z "$DST" && -d "$arg" ]]; then
-    DST="$arg"
-    continue
+  if [[ -z "$START_SEQ" ]] && (($# > 0)) && [[ "$1" =~ $SEQ_REGEX ]]; then
+    START_SEQ="$1"
+    shift
   fi
-  if [[ -z "$FILTER_REGEX" ]]; then
-    FILTER_REGEX="$arg"
-    continue
+  if [[ -z "$FILTER_REGEX" ]] && (($# > 0)); then
+    FILTER_REGEX="$1"
+    shift
   fi
-  if [[ -z "$DST" ]]; then
-    DST="$arg"
-    continue
+  (($# == 0)) || fail "无法识别的额外参数: $1"
+  if [[ "$ACTION" == undo ]]; then
+    [[ "$MODE" == interactive && -z "$SRC$DST$START_SEQ$FILTER_REGEX$FILTER_EXCLUDE_REGEX" ]] || fail "-undo 不可和创建参数组合使用"
   fi
-  echo "无法识别的额外参数: $arg"
-  exit 1
-done
+}
 
-if [[ -z "$SRC" ]]; then
-  show_help
-  exit 0
-fi
+validate_regex() {
+  local status
+  [[ -n "$2" ]] || return 0
+  [[ "" =~ $2 ]]
+  status=$?
+  ((status != 2)) || fail "$1 的正则表达式无效: $2"
+}
 
-if [[ ! -e "$SRC" ]]; then
-  echo "源路径不存在"
-  exit 2
-fi
-
-if [[ -n "$DST" ]]; then
-  DST=$(realpath "$DST" 2>/dev/null) || DST=$(cd "$(dirname "$DST")" && pwd)/$(basename "$DST")
-  if [[ ! -d "$DST" ]]; then
-    echo "目标路径必须是已存在目录"
-    exit 3
+initialize_sequence() {
+  CURR_S=1
+  CURR_E=1
+  S_DIGITS=2
+  E_DIGITS=2
+  HAS_END=0
+  END_E=0
+  [[ "$MODE" != original && -n "$START_SEQ" ]] || return 0
+  [[ "$START_SEQ" =~ $SEQ_REGEX ]] || fail "序号格式错误，示例 s01e01 或 s01e01-s01e12" 4
+  local season="${BASH_REMATCH[1]}" episode="${BASH_REMATCH[2]}"
+  local end_season="${BASH_REMATCH[4]}" end_episode="${BASH_REMATCH[5]}"
+  S_DIGITS=${#season}
+  E_DIGITS=${#episode}
+  CURR_S=$((10#$season))
+  CURR_E=$((10#$episode))
+  if [[ -n "$end_episode" ]]; then
+    ((10#$end_season == CURR_S)) || fail "结束序号季数必须与起始序号相同" 4
+    END_E=$((10#$end_episode))
+    ((END_E > CURR_E)) || fail "结束序号集数必须大于起始序号" 4
+    HAS_END=1
+    ((${#end_season} <= S_DIGITS)) || S_DIGITS=${#end_season}
+    ((${#end_episode} <= E_DIGITS)) || E_DIGITS=${#end_episode}
   fi
-fi
+}
 
-collect_files_and_dirs() {
-  files=()
-  dirs=()
+validate_inputs() {
+  [[ -n "$SRC" ]] || fail "源路径不能为空，使用 -h 查看帮助"
+  [[ -f "$SRC" || -d "$SRC" ]] || fail "源路径必须是文件或目录: $SRC" 2
+  # 末尾标记防止命令替换丢失路径本身末尾的换行。
+  SRC=$(realpath -e -- "$SRC" && printf '.') || fail "无法解析源路径" 2
+  SRC=${SRC%$'\n.'}
+  if [[ -n "$DST" ]]; then
+    [[ -d "$DST" ]] || fail "目标路径必须是已存在目录: $DST" 3
+    DST=$(realpath -e -- "$DST" && printf '.') || fail "无法解析目标路径" 3
+    DST=${DST%$'\n.'}
+  fi
+  validate_regex -fi "$FILTER_REGEX"
+  validate_regex -fe "$FILTER_EXCLUDE_REGEX"
+  initialize_sequence
+}
 
+file_matches() {
+  local name="${1##*/}"
+  [[ -z "$FILTER_REGEX" || "$name" =~ $FILTER_REGEX ]] || return 1
+  [[ -z "$FILTER_EXCLUDE_REGEX" || ! "$name" =~ $FILTER_EXCLUDE_REGEX ]]
+}
+
+collect_files() {
+  local path
+  WORK_DIR=$(mktemp -d) || fail "创建临时目录失败"
   if [[ -f "$SRC" ]]; then
-    files+=("$SRC")
+    file_matches "$SRC" && FILES+=("$SRC")
   else
-    while IFS= read -r -d '' d; do dirs+=("$d"); done < <(find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0)
-    while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$SRC" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
-  fi
-
-  apply_filter
-
-  if [[ ${#files[@]} -gt 0 ]]; then
-    IFS=$'\n' files=($(sort <<<"${files[*]}")); unset IFS
-  fi
-  if [[ ${#dirs[@]} -gt 0 ]]; then
-    IFS=$'\n' dirs=($(sort <<<"${dirs[*]}")); unset IFS
+    find "$SRC" -maxdepth 1 -type f \( -iname '*.mp4' -o -iname '*.mkv' \) -print0 | sort -z >"$WORK_DIR/files" || fail "读取源文件失败"
+    while IFS= read -r -d '' path; do
+      file_matches "$path" && FILES+=("$path")
+    done <"$WORK_DIR/files"
+    find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z >"$WORK_DIR/directories" || fail "读取源目录失败"
+    while IFS= read -r -d '' path; do DIRECTORIES+=("$path"); done <"$WORK_DIR/directories"
   fi
 }
 
-count_files_in_dir() {
-  local d="$1"
-  local c=0
-  if [[ -z "$FILTER_REGEX" && -z "$FILTER_EXCLUDE_REGEX" ]]; then
-    c=$(find "$d" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) | wc -l)
-  else
-    while IFS= read -r -d "" f; do
-      local base
-      base=$(basename "$f")
-      [[ -n "$FILTER_REGEX" ]] && [[ ! "$base" =~ $FILTER_REGEX ]] && continue
-      [[ -n "$FILTER_EXCLUDE_REGEX" ]] && [[ "$base" =~ $FILTER_EXCLUDE_REGEX ]] && continue
-      ((c++))
-    done < <(find "$d" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
-  fi
-  echo "$c"
-}
-
-apply_filter() {
-  if [[ -z "$FILTER_REGEX" && -z "$FILTER_EXCLUDE_REGEX" ]]; then return; fi
-  local filtered=()
-  for f in "${files[@]}"; do
-    local base
-    base=$(basename "$f")
-    if [[ -n "$FILTER_REGEX" ]] && [[ ! "$base" =~ $FILTER_REGEX ]]; then
-      continue
-    fi
-    if [[ -n "$FILTER_EXCLUDE_REGEX" ]] && [[ "$base" =~ $FILTER_EXCLUDE_REGEX ]]; then
-      continue
-    fi
-    filtered+=("$f")
+preflight_named_targets() {
+  local source episode="$CURR_E"
+  for source in "${FILES[@]}"; do
+    ((! HAS_END || episode <= END_E)) || break
+    set_default_target "$source" "$CURR_S" "$episode"
+    [[ ! "$source" -ef "$TARGET" ]] || fail "目标目录已存在同一文件（same file），停止执行: $source → $TARGET"
+    [[ "$MODE" == original ]] || ((episode++))
   done
-  files=("${filtered[@]}")
 }
 
-preview_mode() {
-  collect_files_and_dirs
-  echo "===== 预览内容 ====="
-  if [[ -n "$FILTER_REGEX" ]]; then
-    echo "应用包含正则: $FILTER_REGEX"
-  fi
-  if [[ -n "$FILTER_EXCLUDE_REGEX" ]]; then
-    echo "应用排除正则: $FILTER_EXCLUDE_REGEX"
-  fi
-  if [[ ${#dirs[@]} -gt 0 ]]; then
-    echo "目录："
-    for d in "${dirs[@]}"; do
-      n=$(count_files_in_dir "$d")
-      if [[ (-n "$FILTER_REGEX" || -n "$FILTER_EXCLUDE_REGEX") && $n -eq 0 ]]; then
-        continue
-      fi
-      echo "  $(basename "$d")   (包含 $n 个文件)"
-    done
-  fi
-  if [[ ${#files[@]} -gt 0 ]]; then
-    echo "文件："
-    local temp_curr_s=$curr_s
-    local temp_curr_e=$curr_e
-    local printed=0
-    for f in "${files[@]}"; do
-      base=$(basename "$f")
-      if [[ $USE_ORIGINAL -eq 0 && $HAS_END_SEQ -eq 1 && $temp_curr_e -gt $end_e ]]; then
-        echo "  (达到结束序号 $(format_seq $start_s $end_e)，后续文件未展示)"
-        printed=1
-        break
-      fi
-      if [[ $USE_ORIGINAL -eq 0 ]]; then
-        ext="${base##*.}"
-        name="${base%.*}"
-        seqname="$(format_seq $temp_curr_s $temp_curr_e)"
-        echo "  $base  →  ${name} - ${seqname}.${ext}"
-        ((temp_curr_e++))
-      else
-        echo "  $base"
-      fi
-      printed=1
-    done
-    if [[ $printed -eq 0 && (-n "$FILTER_REGEX" || -n "$FILTER_EXCLUDE_REGEX") ]]; then
-      echo "  (过滤后无匹配文件)"
+preflight_same_files() {
+  local source target identity episode="$CURR_E" target_count=0
+  local -A selected_sources=() target_paths=()
+  ((${#FILES[@]} > 0)) || return 0
+  # 索引设备号和 inode，不读取文件内容，也不依赖目标名称。
+  find -L "$DST" -maxdepth 1 -type f -printf '%D:%i\0%p\0' >"$WORK_DIR/identities" || fail "检查目标文件身份失败: $DST"
+  while IFS= read -r -d '' identity; do
+    IFS= read -r -d '' target || fail "目标文件身份数据不完整"
+    ((target_count++))
+    if ((target_count > 1000)); then
+      preflight_named_targets
+      return
     fi
-  elif [[ -n "$FILTER_REGEX" || -n "$FILTER_EXCLUDE_REGEX" ]]; then
-    echo "文件："
-    echo "  (过滤后无匹配文件)"
+    target_paths["$identity"]="$target"
+  done <"$WORK_DIR/identities"
+  for source in "${FILES[@]}"; do
+    ((! HAS_END || episode <= END_E)) || break
+    selected_sources["$source"]=1
+    [[ "$MODE" == original ]] || ((episode++))
+  done
+  find "$SRC" -maxdepth 1 -type f -printf '%D:%i\0%p\0' >"$WORK_DIR/identities" || fail "检查源文件身份失败: $SRC"
+  while IFS= read -r -d '' identity; do
+    IFS= read -r -d '' source || fail "源文件身份数据不完整"
+    [[ -n "${selected_sources["$source"]+present}" ]] || continue
+    if [[ -n "${target_paths["$identity"]+present}" ]]; then
+      fail "目标目录已存在同一文件（same file），停止执行: $source → ${target_paths["$identity"]}"
+    fi
+  done <"$WORK_DIR/identities"
+}
+
+set_default_target() {
+  local name="${1##*/}"
+  if [[ "$MODE" == original ]]; then
+    TARGET="$DST/$name"
+  else
+    printf -v TARGET '%s/%s - s%0*de%0*d.%s' "$DST" "${name%.*}" "$S_DIGITS" "$2" "$E_DIGITS" "$3" "${name##*.}"
   fi
+}
+
+preview() {
+  local directory path count episode="$CURR_E"
+  echo "===== 预览内容 ====="
+  [[ -z "$FILTER_REGEX" ]] || echo "应用包含正则: $FILTER_REGEX"
+  [[ -z "$FILTER_EXCLUDE_REGEX" ]] || echo "应用排除正则: $FILTER_EXCLUDE_REGEX"
+  for directory in "${DIRECTORIES[@]}"; do
+    count=0
+    find "$directory" -maxdepth 1 -type f \( -iname '*.mp4' -o -iname '*.mkv' \) -print0 >"$WORK_DIR/files" || fail "读取目录失败: $directory"
+    while IFS= read -r -d '' path; do
+      if file_matches "$path"; then ((count++)); fi
+    done <"$WORK_DIR/files"
+    [[ -z "$FILTER_REGEX$FILTER_EXCLUDE_REGEX" || $count -gt 0 ]] || continue
+    printf '目录: %s (包含 %d 个文件)\n' "${directory##*/}" "$count"
+  done
+  for path in "${FILES[@]}"; do
+    ((! HAS_END || episode <= END_E)) || break
+    set_default_target "$path" "$CURR_S" "$episode"
+    if [[ "$MODE" == original ]]; then
+      printf '  %s\n' "${TARGET##*/}"
+    else
+      printf '  %s → %s\n' "${path##*/}" "${TARGET##*/}"
+      ((episode++))
+    fi
+  done
+  ((${#FILES[@]} > 0)) || echo "文件: (无匹配文件)"
   echo "===== 预览结束 ====="
 }
 
-declare -A exist_map=()
-scan_target_one_level() {
-  if [[ -z "$DST" ]]; then return; fi
-  while IFS= read -r -d '' f; do exist_map["$(basename "$f")"]="file"; done < <(find "$DST" -mindepth 1 -maxdepth 1 -type f -print0)
-  while IFS= read -r -d '' d; do exist_map["$(basename "$d")"]="dir"; done < <(find "$DST" -mindepth 1 -maxdepth 1 -type d -print0)
+# 先保存待提交快照，再发布链接；主记录提交失败时保留快照供撤销。
+prepare_log() {
+  [[ -n "$LOG_TEMP" ]] && return 0
+  [[ ! -e "$LOGFILE" || -f "$LOGFILE" ]] || fail "运行记录路径不是文件: $LOGFILE"
+  [[ ! -e "$PENDING_LOG" || -f "$PENDING_LOG" ]] || fail "待提交记录路径不是文件: $PENDING_LOG"
+  LOG_TEMP=$(mktemp "$LOGFILE.XXXXXX") || fail "创建运行记录失败: $LOGFILE"
 }
 
-prompt_rename() {
-  local oldname="$1"
-  local base="${oldname%.*}"
-  local ext="${oldname##*.}"
-  local newbase=""
+write_pending() {
+  local i
+  prepare_log
+  {
+    printf '%s\0' "$LOG_FORMAT" || fail "写入运行记录失败"
+    for i in "${!RECORD_PATHS[@]}"; do
+      [[ -n "${RECORD_PATHS[i]}" ]] || continue
+      printf '%s\0%s\0%s\0' "${RECORD_PATHS[i]}" "${RECORD_IDS[i]}" "${RECORD_KINDS[i]}" || fail "写入运行记录失败"
+    done
+  } >"$LOG_TEMP" || fail "写入运行记录失败: $LOGFILE"
+  mv -fT -- "$LOG_TEMP" "$PENDING_LOG" || fail "保存待提交记录失败: $PENDING_LOG"
+  LOG_TEMP=""
+}
+
+commit_pending() {
+  mv -fT -- "$PENDING_LOG" "$LOGFILE" || fail "提交运行记录失败；待提交记录已保留，请执行 -undo"
+}
+
+file_identity() {
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  # 创建时间不随硬链接计数变化，并能区分多数 inode 重用。
+  stat -c '%d:%i:%w' -- "$1"
+}
+
+identity_matches() {
+  local actual
+  actual=$(file_identity "$1") || return 1
+  [[ "$actual" == "$2" ]]
+}
+
+load_log() {
+  local record="$LOGFILE" marker path identity kind descriptor
+  if path_exists "$PENDING_LOG"; then record="$PENDING_LOG"; fi
+  [[ -f "$record" ]] || fail "未找到可读取的运行记录，无法撤销"
+  exec {descriptor}<"$record" || fail "读取运行记录失败"
+  IFS= read -r -d '' marker <&"$descriptor" || fail "旧版记录缺少文件身份，不能安全自动撤销；请手动核对"
+  [[ "$marker" != vlink-log-v1 ]] || fail "旧版记录缺少文件身份，不能安全自动撤销；请手动核对"
+  [[ "$marker" == "$LOG_FORMAT" ]] || fail "无法识别运行记录格式"
+  while IFS= read -r -d '' path <&"$descriptor"; do
+    IFS= read -r -d '' identity <&"$descriptor" || fail "运行记录不完整，未执行撤销"
+    IFS= read -r -d '' kind <&"$descriptor" || fail "运行记录不完整，未执行撤销"
+    [[ "$path" == /* && "$path" != "$LOGFILE" && "$path" != "$PENDING_LOG" ]] || fail "运行记录包含无效路径，未执行撤销"
+    [[ "$identity" =~ ^[0-9]+:[0-9]+: ]] || fail "运行记录包含无效文件身份，未执行撤销"
+    [[ "$kind" == link || "$kind" == stage ]] || fail "运行记录包含无效对象类型，未执行撤销"
+    RECORD_PATHS+=("$path")
+    RECORD_IDS+=("$identity")
+    RECORD_KINDS+=("$kind")
+  done
+  [[ -z "$path" ]] || fail "运行记录不完整，未执行撤销"
+  exec {descriptor}<&-
+}
+
+undo() {
+  local i path actual parent pending=0
+  load_log
+  echo "开始撤销..."
+  write_pending
+  for i in "${!RECORD_PATHS[@]}"; do
+    path="${RECORD_PATHS[i]}"
+    if path_exists "$path"; then
+      actual=""
+      if [[ -f "$path" && ! -L "$path" ]]; then
+        if ! actual=$(file_identity "$path"); then
+          echo "读取文件身份失败，保留撤销项: $path" >&2
+          pending=1
+          continue
+        fi
+      fi
+      if [[ "$actual" == "${RECORD_IDS[i]}" ]]; then
+        if ! rm -f -- "$path"; then
+          pending=1
+          continue
+        fi
+        echo "删除文件: $path"
+      else
+        echo "路径已被替换，保留当前对象并移除失效记录: $path" >&2
+      fi
+    fi
+    if [[ "${RECORD_KINDS[i]}" == stage ]]; then
+      parent=${path%/*}
+      if [[ -d "$parent" ]] && ! rmdir -- "$parent"; then
+        pending=1
+        continue
+      fi
+    fi
+    RECORD_PATHS[i]=""
+    RECORD_IDS[i]=""
+    RECORD_KINDS[i]=""
+    write_pending
+    commit_pending
+  done
+  if [[ -f "$PENDING_LOG" ]]; then commit_pending; fi
+  ((! pending)) || fail "部分路径未删除，运行记录只保留未完成项。"
+  rm -f -- "$LOGFILE" || fail "清理运行记录失败"
+  echo "撤销完成。"
+}
+
+read_reply() {
+  printf '%s' "$1" >&2
+  IFS= read -r REPLY || fail "输入已结束，停止处理。"
+}
+
+path_exists() {
+  [[ -e "$1" || -L "$1" ]]
+}
+
+choose_target() {
+  local source="$1" name="${1##*/}" exists season episode
+  DECISION="create"
   while :; do
-    read -r -p "输入新文件名（无后缀），输入 pass 跳过: " newbase || return 2
-    [[ "$newbase" == "pass" ]] && { echo "skip"; return 1; }
-    [[ -z "$newbase" ]] && { echo "文件名不能为空"; continue; }
-    local candidate="${newbase}.${ext}"
-    [[ -n "${exist_map[$candidate]}" ]] && { echo "冲突：$candidate 已存在，请重试"; continue; }
-    echo "$candidate"
+    set_default_target "$source" "$CURR_S" "$CURR_E"
+    exists=0
+    path_exists "$TARGET" && exists=1
+    if [[ "$MODE" != interactive && $exists == 0 ]]; then return 0; fi
+    printf '源文件: %s\n目标文件: %s\n' "$source" "$TARGET"
+    if ((exists)); then
+      if [[ "$MODE" == interactive ]]; then
+        read_reply '输入新名字（无后缀），pass 跳过，end 结束，回车覆盖: '
+      elif [[ "$MODE" == fast ]]; then
+        read_reply '输入新名字（无后缀），pass 跳过，end 结束: '
+      else read_reply '输入新名字（无后缀），pass 跳过: '; fi
+    else read_reply '回车接受默认，sXXeXX 改序号，pass 跳过，end 结束: '; fi
+    if [[ "$REPLY" == pass ]]; then
+      DECISION="skip"
+      return 0
+    fi
+    if [[ "$REPLY" == end && "$MODE" != original ]]; then
+      DECISION="end"
+      return 0
+    fi
+    if [[ -z "$REPLY" ]]; then
+      if [[ "$MODE" == interactive ]]; then
+        ((! exists)) || DECISION="replace"
+        return 0
+      fi
+      echo "文件名不能为空" >&2
+      continue
+    fi
+    if ((! exists)) && [[ "$REPLY" =~ ^s([0-9]+)e([0-9]+)$ ]]; then
+      season="${BASH_REMATCH[1]}"
+      episode="${BASH_REMATCH[2]}"
+      if ((HAS_END && (10#$season != CURR_S || 10#$episode > END_E))); then
+        echo "新序号必须与起始季数相同，且不超过结束序号" >&2
+        continue
+      fi
+      CURR_S=$((10#$season))
+      CURR_E=$((10#$episode))
+      ((${#season} <= S_DIGITS)) || S_DIGITS=${#season}
+      ((${#episode} <= E_DIGITS)) || E_DIGITS=${#episode}
+      continue
+    fi
+    ((exists)) || {
+      echo "输入无效，请重试" >&2
+      continue
+    }
+    [[ "$REPLY" != */* && "$REPLY" != *\\* ]] || {
+      echo "请输入文件名，不要包含路径" >&2
+      continue
+    }
+    TARGET="$DST/$REPLY.${name##*.}"
+    if path_exists "$TARGET"; then
+      echo "目标已存在，请重试: $TARGET" >&2
+      continue
+    fi
     return 0
   done
 }
 
-add_created() {
-  CREATED_ITEMS+=("$1")
-}
-
-create_link() {
-  local source="$1"
-  local target="$2"
-  ln -- "$source" "$target" || abort_run "创建硬链接失败: $target"
-  echo "创建硬链接: $target"
-  add_created "$target"
-}
-
-replace_link() {
-  local source="$1"
-  local target="$2"
-  local temporary_directory
-  temporary_directory=$(mktemp -d "$(dirname -- "$target")/.vlink.XXXXXX") || abort_run "创建临时目录失败: $target"
-  if ! ln -- "$source" "$temporary_directory/link"; then
-    rmdir -- "$temporary_directory"
-    abort_run "创建硬链接失败，保留原目标: $target"
-  fi
-  if ! mv -fT -- "$temporary_directory/link" "$target"; then
-    rm -f -- "$temporary_directory/link"
-    rmdir -- "$temporary_directory"
-    abort_run "替换硬链接失败，保留原目标: $target"
-  fi
-  add_created "$target"
-  rmdir -- "$temporary_directory" || abort_run "清理临时目录失败: $temporary_directory"
-  echo "创建硬链接: $target"
-}
-
-fast_mode() {
-  collect_files_and_dirs
-  scan_target_one_level
-
-  for f in "${files[@]}"; do
-    if [[ $HAS_END_SEQ -eq 1 && $curr_e -gt $end_e ]]; then
-      echo "已达到结束序号 $(format_seq $start_s $end_e)，停止处理剩余文件。"
-      break
-    fi
-    basef=$(basename "$f")
-    ext="${basef##*.}"
-    name="${basef%.*}"
-
-    while :; do
-      seqname="$(format_seq $curr_s $curr_e)"
-      newname="${name} - ${seqname}.${ext}"
-      target_f="$DST/$newname"
-
-      if [[ -e "$target_f" ]]; then
-        echo "重名文件: $target_f，必须处理"
-        read -r -p "输入新文件名(无后缀)或 pass跳过，end结束: " nn || abort_run "输入已结束，停止处理。"
-        if [[ "$nn" == "end" ]]; then
-          echo "结束剩余文件处理"
-          target_f=""
-          break 2
-        fi
-        [[ "$nn" == "pass" ]] && { echo "跳过文件 $f"; target_f=""; break; }
-        [[ -z "$nn" ]] && { echo "文件名不能为空"; continue; }
-        candidate="$DST/$nn.$ext"
-        if [[ -e "$candidate" ]]; then
-          echo "文件已存在，重试"
-          continue
-        fi
-        target_f="$candidate"
-        break
-      else
-        break
-      fi
-    done
-    [[ -z "$target_f" ]] && continue
-
-    create_link "$f" "$target_f"
-    exist_map["$(basename "$target_f")"]="file"
-    ((curr_e++))
-  done
-  echo "一键执行完成，生成文件及目录列表："
-  for item in "${CREATED_ITEMS[@]}"; do
-    echo "$item"
-  done
-}
-
-start_s=1
-start_e=1
-if [[ $USE_ORIGINAL -eq 0 && -n "$START_SEQ" ]]; then
-  if [[ "$START_SEQ" =~ $SEQ_REGEX ]]; then
-    start_s_str="${BASH_REMATCH[1]}"
-    start_e_str="${BASH_REMATCH[2]}"
-    seq_s_digits=${#start_s_str}
-    seq_e_digits=${#start_e_str}
-    start_s=$((10#${start_s_str}))
-    start_e=$((10#${start_e_str}))
-
-    if [[ -n "${BASH_REMATCH[3]}" ]]; then
-      end_s_str="${BASH_REMATCH[4]}"
-      end_e_str="${BASH_REMATCH[5]}"
-      end_s=$((10#${end_s_str}))
-      end_e=$((10#${end_e_str}))
-      if (( end_s != start_s )); then
-        echo "结束序号季数必须与起始序号相同"
-        exit 4
-      fi
-      if (( end_e <= start_e )); then
-        echo "结束序号集数必须大于起始序号"
-        exit 4
-      fi
-      HAS_END_SEQ=1
-      if [[ ${#end_s_str} -gt $seq_s_digits ]]; then
-        seq_s_digits=${#end_s_str}
-      fi
-      if [[ ${#end_e_str} -gt $seq_e_digits ]]; then
-        seq_e_digits=${#end_e_str}
-      fi
+create_target() {
+  local source="$1" identity stage_index
+  [[ "$TARGET" != "$LOGFILE" && "$TARGET" != "$PENDING_LOG" ]] || fail "目标不能覆盖运行记录"
+  [[ ! "$source" -ef "$TARGET" ]] || fail "源文件与目标指向同一文件（same file），停止执行: $source → $TARGET"
+  prepare_log
+  WORK_DIR=$(mktemp -d "$DST/.vlink.XXXXXX") || fail "创建临时目录失败"
+  ln -T -- "$source" "$WORK_DIR/link" || fail "创建临时硬链接失败，保留原目标: $TARGET"
+  identity=$(file_identity "$WORK_DIR/link") || fail "读取临时硬链接身份失败"
+  stage_index=${#RECORD_PATHS[@]}
+  RECORD_PATHS+=("$WORK_DIR/link")
+  RECORD_IDS+=("$identity")
+  RECORD_KINDS+=(stage)
+  RECORD_PATHS+=("$TARGET")
+  RECORD_IDS+=("$identity")
+  RECORD_KINDS+=(link)
+  write_pending
+  if [[ "$DECISION" == replace ]]; then
+    if mv -fT -- "$WORK_DIR/link" "$TARGET"; then
+      :
+    else
+      identity_matches "$TARGET" "$identity" || rm -f -- "$PENDING_LOG"
+      fail "替换硬链接失败，保留原目标: $TARGET"
     fi
   else
-    echo "序号格式错误 示例 s01e01 或 s01e01,s01e12"
-    exit 4
+    if ln -T -- "$WORK_DIR/link" "$TARGET"; then
+      :
+    else
+      identity_matches "$TARGET" "$identity" || rm -f -- "$PENDING_LOG"
+      fail "创建硬链接失败: $TARGET"
+    fi
   fi
-fi
-curr_s=$start_s
-curr_e=$start_e
+  CREATED_ITEMS+=("$TARGET")
+  cleanup_work
+  if ! path_exists "${RECORD_PATHS[stage_index]%/*}"; then
+    RECORD_PATHS[stage_index]=""
+    RECORD_IDS[stage_index]=""
+    RECORD_KINDS[stage_index]=""
+  fi
+  write_pending
+  commit_pending
+  echo "创建硬链接: $TARGET"
+}
 
-if [[ -z "$DST" ]]; then
-  preview_mode
-  exit 0
-fi
-
-scan_target_one_level
-
-collect_files_and_dirs
-
-if [[ $USE_FAST -eq 1 ]]; then
-  fast_mode
-  write_created_log || abort_run "写入运行记录失败: $LOGFILE"
-  exit 0
-elif [[ $USE_ORIGINAL -eq 1 ]]; then
-  for f in "${files[@]}"; do
-    if [[ $HAS_END_SEQ -eq 1 && $curr_e -gt $end_e ]]; then
-      echo "已达到结束序号 $(format_seq $start_s $end_e)，停止处理剩余文件。"
-      break
-    fi
-    base=$(basename "$f")
-    target="$DST/$base"
-    if [[ -e "$target" ]]; then
-      echo "重名文件: $base"
-      if newname=$(prompt_rename "$base"); then
-        target="$DST/$newname"
-      else
-        rename_status=$?
-        [[ $rename_status -eq 1 ]] && { echo "跳过 $base"; continue; }
-        abort_run "输入已结束，停止处理。"
-      fi
-    fi
-    create_link "$f" "$target"
-    exist_map["$(basename "$target")"]="file"
+execute() {
+  local source
+  ! path_exists "$PENDING_LOG" || fail "存在未提交的运行记录，请先执行 -undo"
+  preflight_same_files
+  cleanup_work
+  for source in "${FILES[@]}"; do
+    ((! HAS_END || CURR_E <= END_E)) || break
+    choose_target "$source"
+    case "$DECISION" in
+    skip) continue ;;
+    end) break ;;
+    esac
+    create_target "$source"
+    [[ "$MODE" == original ]] || ((CURR_E++))
   done
-else
-  IFS=$'\n' sorted_files=($(printf '%s\n' "${files[@]##*/}" | sort))
-  tmp_files=()
-  for fbase in "${sorted_files[@]}"; do
-    for ff in "${files[@]}"; do
-      [[ "${ff##*/}" == "$fbase" ]] && { tmp_files+=("$ff"); break; }
-    done
-  done
-  files=("${tmp_files[@]}")
+  printf '共生成 %d 个文件\n' "${#CREATED_ITEMS[@]}"
+}
 
-  for f in "${files[@]}"; do
-    if [[ $HAS_END_SEQ -eq 1 && $curr_e -gt $end_e ]]; then
-      echo "已达到结束序号 $(format_seq $start_s $end_e)，停止处理剩余文件。"
-      break
-    fi
-    base=$(basename "$f")
-    ext="${base##*.}"
-    name="${base%.*}"
-    seqname="$(format_seq $curr_s $curr_e)"
-    newname="${name} - ${seqname}.${ext}"
-    target="$DST/$newname"
-    while :; do
-      echo ""
-      echo "源文件: $base"
-      echo "默认命名: $newname"
-      if [[ -e "$target" ]]; then
-        echo "目标已存在: $newname"
-        read -r -p "输入新名字（无后缀）pass跳过，end结束，回车覆盖: " newbasename || abort_run "输入已结束，停止处理。"
-        if [[ -z "$newbasename" ]]; then
-          echo "覆盖文件 $newname"
-          replace_link "$f" "$target"
-          exist_map["$newname"]="file"
-          ((curr_e++))
-          break
-        elif [[ "$newbasename" == "pass" ]]; then
-          echo "跳过 $base"
-          break
-        elif [[ "$newbasename" == "end" ]]; then
-          echo "结束剩余文件处理"
-          break 2
-        else
-          candidate="${newbasename}.${ext}"
-          [[ -e "$DST/$candidate" ]] && { echo "冲突 $candidate 重试"; continue; }
-          target="$DST/$candidate"
-          create_link "$f" "$target"
-          exist_map["$candidate"]="file"
-          ((curr_e++))
-          break
-        fi
-      else
-        [[ $USE_FAST -eq 1 ]] && {
-          create_link "$f" "$target"
-          exist_map["$newname"]="file"
-          ((curr_e++))
-          break
-        }
-        read -r -p "回车接受默认，sXXeXX改序号，pass跳过，end结束: " input || abort_run "输入已结束，停止处理。"
-        if [[ -z "$input" ]]; then
-          create_link "$f" "$target"
-          exist_map["$newname"]="file"
-          ((curr_e++))
-          break
-        elif [[ "$input" =~ ^s([0-9]+)e([0-9]+)$ ]]; then
-          new_seq_s="${BASH_REMATCH[1]}"
-          new_seq_e="${BASH_REMATCH[2]}"
-          new_s=$((10#${new_seq_s}))
-          new_e=$((10#${new_seq_e}))
-          if [[ $HAS_END_SEQ -eq 1 ]]; then
-            expected_season=$(printf "s%0${seq_s_digits}d" "$start_s")
-            if (( new_s != start_s )); then
-              echo "季数必须保持为 ${expected_season}"
-              continue
-            fi
-            if (( new_e > end_e )); then
-              echo "已超过结束序号 $(format_seq $start_s $end_e)"
-              continue
-            fi
-          fi
-          if [[ ${#new_seq_s} -gt $seq_s_digits ]]; then
-            seq_s_digits=${#new_seq_s}
-          fi
-          if [[ ${#new_seq_e} -gt $seq_e_digits ]]; then
-            seq_e_digits=${#new_seq_e}
-          fi
-          curr_s=$new_s
-          curr_e=$new_e
-          seqname="$(format_seq $curr_s $curr_e)"
-          newname="${name} - ${seqname}.${ext}"
-          target="$DST/$newname"
-          echo "序号重置为 $seqname"
-        elif [[ "$input" == "pass" ]]; then
-          echo "跳过 $base"
-          break
-        elif [[ "$input" == "end" ]]; then
-          echo "结束剩余文件处理"
-          break 2
-        else
-          echo "输入无效，请重试"
-        fi
-      fi
-    done
-  done
-fi
+main() {
+  if (($# == 0)); then
+    show_help
+    return
+  fi
+  parse_args "$@"
+  if [[ "$ACTION" == undo ]]; then
+    acquire_lock
+    undo
+    return
+  fi
+  validate_inputs
+  [[ -z "$DST" ]] || acquire_lock
+  collect_files
+  if [[ -z "$DST" ]]; then preview; else execute; fi
+}
 
-echo "写入已创建文件和目录列表到 $LOGFILE"
-write_created_log || abort_run "写入运行记录失败: $LOGFILE"
-echo "共生成 ${#CREATED_ITEMS[@]} 个文件/目录"
-
-if [[ $USE_FAST -eq 0 ]]; then
-  echo "生成的所有文件和目录路径:"
-  for item in "${CREATED_ITEMS[@]}"; do
-    echo "$item"
-  done
-fi
-
-exit 0
+main "$@"

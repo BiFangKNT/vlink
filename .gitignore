@@ -1,1 +1,3 @@
 vlink_last_run.log
+vlink_last_run.log.*
+.vlink.*/
